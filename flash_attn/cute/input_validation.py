@@ -149,3 +149,81 @@ def validate_attention_inputs(
             raise ValueError(
                 f"{name} must be on a CUDA device, got {tensor.device}; move the inputs with .to('cuda')."
             )
+
+
+def validate_qkvpacked_inputs(
+    qkv,
+    *,
+    cu_seqlens=None,
+    seqused=None,
+    num_heads_q=None,
+    learnable_sink=None,
+    allow_cpu=False,
+):
+    """Validate packed self-attention inputs and return Q/K/V views.
+
+    Canonical MHA packing uses ``(B, S, 3, H, D)`` or
+    ``(T, 3, H, D)``.  Concatenated-head GQA/MQA packing uses
+    ``(B, S, Hq + 2 * Hkv, D)`` or ``(T, Hq + 2 * Hkv, D)`` and requires
+    ``num_heads_q=Hq``.  ``seqused`` is supported with dense storage and is
+    shared by Q and K.  Validation remains metadata-only: sequence metadata
+    contents are intentionally not read on the host.
+    """
+    if not isinstance(qkv, torch.Tensor):
+        raise TypeError(f"qkv must be a torch.Tensor, got {type(qkv).__name__}.")
+    if cu_seqlens is not None and seqused is not None:
+        raise ValueError("cu_seqlens and seqused cannot be combined for packed attention.")
+    if num_heads_q is not None and (
+        isinstance(num_heads_q, bool) or not isinstance(num_heads_q, int) or num_heads_q <= 0
+    ):
+        raise ValueError(f"num_heads_q must be a positive host integer, got {num_heads_q!r}.")
+
+    concatenated = num_heads_q is not None
+    varlen = cu_seqlens is not None
+    if concatenated:
+        expected_rank = 3 if varlen else 4
+        layout = (
+            "(total_tokens, heads_q + 2 * heads_kv, head_dim)"
+            if varlen
+            else "(batch, seqlen, heads_q + 2 * heads_kv, head_dim)"
+        )
+        if qkv.ndim != expected_rank:
+            raise ValueError(f"qkv must have shape {layout}, got {tuple(qkv.shape)}.")
+        total_heads = qkv.shape[-2]
+        remaining_heads = total_heads - num_heads_q
+        if remaining_heads <= 0 or remaining_heads % 2 != 0:
+            raise ValueError(
+                "qkv concatenated-head layout requires total_heads - num_heads_q "
+                "to be a positive even number."
+            )
+        num_heads_kv = remaining_heads // 2
+        q = qkv[..., :num_heads_q, :]
+        k = qkv[..., num_heads_q : num_heads_q + num_heads_kv, :]
+        v = qkv[..., num_heads_q + num_heads_kv :, :]
+    else:
+        expected_rank = 4 if varlen else 5
+        layout = (
+            "(total_tokens, 3, heads, head_dim)"
+            if varlen
+            else "(batch, seqlen, 3, heads, head_dim)"
+        )
+        if qkv.ndim != expected_rank:
+            raise ValueError(f"qkv must have shape {layout}, got {tuple(qkv.shape)}.")
+        if qkv.shape[-3] != 3:
+            raise ValueError(
+                f"qkv's packed dimension must have size 3 at axis {-3}, got {qkv.shape[-3]}."
+            )
+        q, k, v = qkv.unbind(dim=-3)
+
+    validate_attention_inputs(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        seqused_q=seqused,
+        seqused_k=seqused,
+        learnable_sink=learnable_sink,
+        allow_cpu=allow_cpu,
+    )
+    return q, k, v

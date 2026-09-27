@@ -19,7 +19,10 @@ from cutlass import Int32, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
-from flash_attn.cute.input_validation import validate_attention_inputs
+from flash_attn.cute.input_validation import (
+    validate_attention_inputs,
+    validate_qkvpacked_inputs,
+)
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -2046,7 +2049,12 @@ def _flash_attn_bwd(
         use_2cta_instrs = False
         num_threads = 128
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
-        assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
+        # The inherited SM80 backward supports the generated softcap
+        # transform. Arbitrary user score modifiers still rely on the newer
+        # architecture-specific backward paths and remain unsupported here.
+        assert (
+            (score_mod is None and score_mod_bwd is None) or softcap != 0.0
+        ), "custom score_mod backward is not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
         assert deterministic is False, "deterministic backward not supported on SM 12.0"
     elif arch // 10 == 9:
@@ -3419,6 +3427,161 @@ def _sparse_mla_dk(
 _sparse_mla_dk.compile_cache = get_jit_cache("dk_gemm")
 
 
+def _validate_packed_max_seqlen(max_seqlen: int) -> None:
+    if isinstance(max_seqlen, bool) or not isinstance(max_seqlen, int) or max_seqlen < 0:
+        raise ValueError(
+            "max_seqlen must be a nonnegative host integer (not a bool or tensor)."
+        )
+
+
+def _packed_qkv_views(qkv, num_heads_q=None):
+    """Return Q/K/V views for canonical or concatenated-head packing."""
+    if num_heads_q is None:
+        return qkv.unbind(dim=-3)
+    num_heads_kv = (qkv.shape[-2] - num_heads_q) // 2
+    return (
+        qkv[..., :num_heads_q, :],
+        qkv[..., num_heads_q : num_heads_q + num_heads_kv, :],
+        qkv[..., num_heads_q + num_heads_kv :, :],
+    )
+
+
+def _zero_packed_unused_query_rows(out, lse, seqused):
+    """Canonicalize the dense seqused convention for every packed path.
+
+    Some SM80-family tiled paths leave dense output/LSE suffix rows outside
+    ``seqused`` unspecified for causal traversal.  The public separate-QKV
+    interface exposes those rows as zero, so enforce the same contract here
+    before saving the tensors for backward.
+    """
+    if seqused is None:
+        return out, lse
+    q_idx = torch.arange(out.shape[1], device=out.device)
+    valid = q_idx[None, :] < seqused[:, None]
+    out = out.masked_fill(~valid[:, :, None, None], 0)
+    if lse is not None:
+        lse = lse.masked_fill(~valid[:, None, :], 0)
+    return out, lse
+
+
+class FlashAttnQKVPackedFunc(torch.autograd.Function):
+    """Shared autograd implementation for dense and varlen packed self-attention."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        qkv,
+        cu_seqlens,
+        max_seqlen,
+        softmax_scale,
+        causal,
+        window_size,
+        learnable_sink,
+        softcap,
+        num_splits,
+        deterministic,
+        score_mod,
+        score_mod_bwd,
+        mask_mod,
+        aux_tensors,
+        aux_scalars,
+        block_sparse_tensors,
+        block_sparse_tensors_bwd,
+        return_lse,
+        seqused,
+        num_heads_q,
+    ):
+        aux_scalars = tuple(aux_scalars) if aux_scalars else None
+        # Keep these as views, including requires_grad: the forward dispatcher
+        # uses it to decide whether to save LSE for backward.
+        q, k, v = _packed_qkv_views(qkv, num_heads_q)
+        out, lse, *_ = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            seqused_q=seqused,
+            seqused_k=seqused,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=None if num_heads_q is not None else False,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            block_sparse_tensors=block_sparse_tensors,
+            return_lse=return_lse,
+        )
+        out, lse = _zero_packed_unused_query_rows(out, lse, seqused)
+        ctx.save_for_backward(
+            qkv, out, lse, learnable_sink, cu_seqlens, seqused, *(aux_tensors or ())
+        )
+        ctx.bwd_kwargs = dict(
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=softcap,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            deterministic=deterministic,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            aux_scalars=aux_scalars,
+            block_sparse_tensors=block_sparse_tensors_bwd,
+        )
+        ctx.return_lse = return_lse
+        ctx.num_heads_q = num_heads_q
+        ctx.set_materialize_grads(False)
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, dlse):
+        qkv, out, lse, learnable_sink, cu_seqlens, seqused, *aux = ctx.saved_tensors
+        q, k, v = _packed_qkv_views(qkv, ctx.num_heads_q)
+        if not ctx.return_lse:
+            dlse = None
+        if dout is None:
+            dout = torch.zeros_like(out)
+        # Allocate canonical contiguous storage even for strided inputs. The
+        # Q/K/V views are disjoint and satisfy the kernels' output-stride ABI.
+        dqkv = torch.empty(qkv.shape, dtype=qkv.dtype, device=qkv.device)
+        dq, dk, dv = _packed_qkv_views(dqkv, ctx.num_heads_q)
+        bwd_result = _flash_attn_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            seqused_q=seqused,
+            seqused_k=seqused,
+            aux_tensors=aux if aux else None,
+            dlse=dlse,
+            learnable_sink=learnable_sink,
+            **ctx.bwd_kwargs,
+        )
+        grads = [None] * len(ctx.needs_input_grad)
+        grads[0] = dqkv
+        if learnable_sink is not None:
+            grads[6] = bwd_result[3]
+        return tuple(grads)
+
+
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -3782,6 +3945,152 @@ def _validate_gather_bwd_kwargs(
                 f"{gather_bwd_token_chunk!r}"
             )
     return gather_bwd_token_chunk
+
+
+def flash_attn_qkvpacked_func(
+    qkv: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
+    return_lse: bool = False,
+    seqused: Optional[torch.Tensor] = None,
+    num_heads_q: Optional[int] = None,
+):
+    """Compute dense self-attention from a packed QKV tensor.
+
+    Canonical MHA packing uses ``(batch, seqlen, 3, heads, head_dim)``.
+    Concatenated-head GQA/MQA packing uses ``(batch, seqlen, Hq + 2 * Hkv,
+    head_dim)`` with ``num_heads_q=Hq``. In either form, ``seqused`` can
+    provide one effective sequence length per batch item for dense storage.
+    Returns ``(out, lse)`` with shapes ``(batch, seqlen, heads_q, head_dim)``
+    and ``(batch, heads_q, seqlen)``.
+
+    Aligned packed inputs are read through views; other layouts use the
+    existing input-copy fallback. Backward writes directly into one contiguous
+    packed gradient buffer, without a final stack of dQ/dK/dV. Kernel workspace
+    and architecture-specific feature restrictions are unchanged. Dense block
+    sparsity uses Q-direction ``block_sparse_tensors_bwd`` for backward.
+    Unlike legacy FA2 APIs, optional arguments are keyword-only and there is
+    no dropout or attention-probability output.
+    """
+    validate_qkvpacked_inputs(
+        qkv,
+        seqused=seqused,
+        num_heads_q=num_heads_q,
+        learnable_sink=learnable_sink,
+        allow_cpu=is_fake_mode(),
+    )
+    if (
+        block_sparse_tensors is not None
+        and block_sparse_tensors_bwd is None
+        and torch.is_grad_enabled()
+        and (qkv.requires_grad or (learnable_sink is not None and learnable_sink.requires_grad))
+    ):
+        raise ValueError(
+            "Packed block-sparse training requires block_sparse_tensors_bwd with Q-direction indexing."
+        )
+    return FlashAttnQKVPackedFunc.apply(
+        qkv,
+        None,
+        None,
+        softmax_scale,
+        causal,
+        window_size,
+        learnable_sink,
+        softcap,
+        num_splits,
+        deterministic,
+        score_mod,
+        score_mod_bwd,
+        mask_mod,
+        aux_tensors,
+        aux_scalars,
+        block_sparse_tensors,
+        block_sparse_tensors_bwd,
+        return_lse,
+        seqused,
+        num_heads_q,
+    )
+
+
+def flash_attn_varlen_qkvpacked_func(
+    qkv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    *,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    return_lse: bool = False,
+    num_heads_q: Optional[int] = None,
+):
+    """Compute variable-length self-attention from a packed QKV tensor.
+
+    Canonical MHA packing uses ``(total_tokens, 3, heads, head_dim)``.
+    Concatenated-head GQA/MQA packing uses ``(total_tokens, Hq + 2 * Hkv,
+    head_dim)`` with ``num_heads_q=Hq``. Boundaries must start at zero, be
+    nondecreasing, and end at total_tokens; they are shared by Q/K/V and are
+    not read on the host during validation. ``max_seqlen`` is a nonnegative
+    host integer bounding every sequence length.
+
+    Returns ``(out, lse)`` with shapes ``(total_tokens, heads_q, head_dim)``
+    and ``(heads_q, total_tokens)``. LSE is FP32 and may be None unless
+    requested or needed for backward. Set ``return_lse=True`` to differentiate
+    through LSE. Varlen block sparsity, paged KV, and MLA are not exposed here.
+    """
+    if cu_seqlens is None:
+        raise TypeError("cu_seqlens must be a torch.Tensor for packed varlen attention.")
+    _validate_packed_max_seqlen(max_seqlen)
+    validate_qkvpacked_inputs(
+        qkv,
+        cu_seqlens=cu_seqlens,
+        num_heads_q=num_heads_q,
+        learnable_sink=learnable_sink,
+        allow_cpu=is_fake_mode(),
+    )
+    return FlashAttnQKVPackedFunc.apply(
+        qkv,
+        cu_seqlens,
+        max_seqlen,
+        softmax_scale,
+        causal,
+        window_size,
+        learnable_sink,
+        softcap,
+        num_splits,
+        deterministic,
+        score_mod,
+        score_mod_bwd,
+        mask_mod,
+        aux_tensors,
+        aux_scalars,
+        None,
+        None,
+        return_lse,
+        None,
+        num_heads_q,
+    )
 
 
 def flash_attn_func(
