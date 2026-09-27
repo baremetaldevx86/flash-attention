@@ -19,6 +19,7 @@ from cutlass import Int32, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
+from flash_attn.cute.input_validation import validate_attention_inputs
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -3808,6 +3809,14 @@ def flash_attn_func(
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
 ):
+    """Compute attention for dense (batch, seqlen, heads, head_dim) tensors.
+
+    Raises TypeError for invalid tensor types or dtypes, and ValueError for
+    incompatible shapes, head counts, or devices, before kernel dispatch.
+    """
+    validate_attention_inputs(
+        q, k, v, qv=qv, learnable_sink=learnable_sink, allow_cpu=is_fake_mode()
+    )
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -3945,7 +3954,16 @@ def flash_attn_varlen_func(
         gather_bwd_recompute_p, making the whole backward transient bounded by the chunk.
         Must be a positive int (anything else raises); requires varlen or batch 1 (warns
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
+
+    Raises TypeError for invalid tensor types or dtypes, and ValueError for
+    incompatible shapes, head counts, or devices, before kernel dispatch.
+    Cumulative-length values are not read on the host during validation.
     """
+    validate_attention_inputs(
+        q, k, v, qv=qv, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q, seqused_k=seqused_k, page_table=page_table,
+        learnable_sink=learnable_sink, allow_cpu=is_fake_mode(),
+    )
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
